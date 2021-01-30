@@ -1,0 +1,339 @@
+---
+title: "demo"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, collapse = T, warning = F, message = F, error = F)
+```
+
+```{r}
+library(tidyverse)
+library(forecast)
+```
+
+## Data Preprocessing
+
+```{r}
+# Load the historical data of your stock
+stock <- read_csv("data/RBL.AX.csv")
+select <- dplyr::select
+```
+
+```{r}
+# We only need date and adj.close price
+stock <- select(stock, Date, price = `Adj Close`) %>%
+  mutate(price = as.numeric(price)) %>%
+  filter(!is.na(price))
+
+# Compute log return (log(today) - log(yesterday))
+stock <- mutate(stock, log_r = log(price) - lag(log(price)))
+```
+
+```{r}
+# Check whether there are AR structure in the log return
+# ARIMA(0,0,0) implies there is no ARIMA structure
+auto.arima(stock$log_r) %>%
+  summary()
+```
+
+```{r}
+# We use the empircal mean to estimate the expected log return
+# Positive estimated mean of log return means, in expectation, you can make profit
+# from this stock
+est_mean <- mean(stock$log_r, na.rm = T)
+est_mean
+```
+
+```{r}
+# Compute the daily square root of residuals
+stock <- mutate(stock, risk = sqrt((log_r - est_mean)^2))
+```
+
+## Naive model - Normal
+
+```{r}
+# Using auto.arima() to fit the data
+mod1 <- auto.arima(stock$risk)
+
+# Assume the log return follows a normal distribution
+stock <- mutate(stock, 
+                fitted = c(NA, mod1$fitted),
+                upper = c(NA, mod1$fitted * 1.96 + est_mean),
+                lower = c(NA, mod1$fitted * -1.96 + est_mean))
+```
+
+
+
+```{r}
+# Plot our predicted 95% CI against the real log return
+# Most of the time the black line should fall between the 95% CI
+ggplot(stock) +
+  geom_line(aes(Date, log_r)) +
+  geom_line(aes(Date, upper, col = "naive Normal")) +
+  geom_line(aes(Date, lower, col = "naive Normal")) +
+  theme_bw() +
+  ylab("Daily Log Return")
+```
+
+```{r}
+# How many percent of the time the log return will exceed the 95% CI
+# If it is greater than 5%, it means the assumption of the distribution is wrong or
+# the prediction of the risk is inaccurate
+mean(stock$log_r > stock$upper | stock$log_r < stock$lower, na.rm = T)
+```
+
+```{r}
+# Predict the next day log return
+point_forecast <- forecast(mod1, 1) %>%
+  .[["mean"]]
+
+# Chance of suffer a loss
+paste("Chance of suffer a loss:", 
+      round(pnorm(0, mean = est_mean, sd = point_forecast)*100, 3), "%")
+
+# 95% CI of log return
+up95 <- point_forecast * 1.96 + est_mean
+lo95 <- point_forecast * -1.96 + est_mean
+paste("Log return 95% CI: (", round(lo95, 3), ",", round(up95 , 3), ")")
+
+# 95% CI of real return
+up95 <- exp(up95) - 1
+lo95 <- exp(lo95) - 1
+paste("Real return 95% CI: (", round(lo95, 3), ",", round(up95, 3), ")")
+
+# 95% CI of next day's price
+up95 <- (1 + up95) * stock$price[length(stock$price)]
+lo95 <- (1 + lo95) * stock$price[length(stock$price)]
+paste("Adjusted Price 95% CI: (", round(lo95, 3), ",", round(up95, 3), ")")
+```
+
+## Naive model - Student-t
+
+```{r}
+# Modify our assumption of the distribution of log return
+# We could check which distribution is suitable for our data
+library(fitdistrplus)
+descdist(stock$log_r[-1], discrete = FALSE)
+```
+
+```{r}
+# Now we fit a student-t distribution and compute the critical value
+df <- fitdist(stock$log_r[-1], "t", start=list(df=2)) %>%
+  .[['estimate']] %>%
+  as.numeric()
+
+crit <- qt(p = 0.975, df = df)
+crit
+```
+
+
+```{r}
+# Compute the 95% CI
+stock <- mutate(stock, 
+                upper_t = c(NA, mod1$fitted * crit + est_mean),
+                lower_t = c(NA, mod1$fitted * -crit + est_mean))
+```
+
+```{r}
+# Plot our predicted 95% CI against the real log return
+# Most of the time the black line should fall between the red lines or the blue lines
+
+ggplot(stock) +
+  geom_line(aes(Date, log_r)) +
+  geom_line(aes(Date, upper, col = "naive Normal")) +
+  geom_line(aes(Date, lower, col = "naive Normal")) +
+  geom_line(aes(Date, upper_t, col = "naive t")) +
+  geom_line(aes(Date, lower_t, col = "naive t")) +
+  theme_bw() +
+  ylab("Daily Log Return")
+```
+
+```{r}
+# How many percent of the time the log return will exceed the 95% CI
+mean(stock$log_r > stock$upper_t | stock$log_r < stock$lower_t, na.rm = T)
+```
+
+```{r}
+# Predict the next day log return
+point_forecast <- forecast(mod1, 1) %>%
+  .[["mean"]]
+
+# Chance of suffer a loss
+paste("Chance of suffer a loss:", 
+      round(pt((-est_mean)/point_forecast, df = df)*100, 3), "%")
+
+# 95% CI of log return
+up95 <- point_forecast * crit + est_mean
+lo95 <- point_forecast * -crit + est_mean
+paste("Log return 95% CI: (", round(lo95, 3), ",", round(up95 , 3), ")")
+
+# 95% CI of real return
+up95 <- exp(up95) - 1
+lo95 <- exp(lo95) - 1
+paste("Real return 95% CI: (", round(lo95, 3), ",", round(up95, 3), ")")
+
+# 95% CI of next day's price
+up95 <- (1 + up95) * stock$price[length(stock$price)]
+lo95 <- (1 + lo95) * stock$price[length(stock$price)]
+paste("Adjusted Price 95% CI: (", round(lo95, 3), ",", round(up95, 3), ")")
+```
+
+## GARCH model - Normal
+
+```{r}
+library(rugarch)
+```
+
+```{r}
+# Fit a ARMA(0,0) - GARCH(1,1) Model
+garch_spec <- ugarchspec(variance.model = list(model = "sGARCH", 
+                                               garchOrder = c(1,1)),
+           mean.model = list(armaOrder = c(0,0), 
+                             include.mean = TRUE))
+
+mod2 <- ugarchfit(garch_spec, stock$log_r[-1])
+```
+
+```{r}
+# Compute the upper and lower bound manually
+stock <- mutate(stock,
+                upper_garch = c(NA, sigma(mod2) * 1.96 + fitted(mod2)),
+                lower_garch = c(NA, sigma(mod2) * -1.96 + fitted(mod2)))
+
+```
+
+
+```{r}
+# Plot our predicted 95% CI against the real log return
+# Most of the time the black line should fall between the 95% CI
+
+ggplot(stock) +
+  geom_line(aes(Date, log_r)) +
+  geom_line(aes(Date, upper, col = "naive Normal")) +
+  geom_line(aes(Date, lower, col = "naive Normal")) +
+  geom_line(aes(Date, upper_t, col = "naive t")) +
+  geom_line(aes(Date, lower_t, col = "naive t")) +
+  geom_line(aes(Date, upper_garch, col = "GARCH Normal")) +
+  geom_line(aes(Date, lower_garch, col = "GARCH Normal")) +
+  theme_bw() +
+  ylab("Daily Log Return")
+```
+
+
+
+```{r}
+# How many percent of the time the log return will exceed the 95% CI
+# If it is greater than 5%, it means the assumption of the distribution is wrong or
+# the prediction of the risk is inaccurate
+mean(stock$log_r > stock$upper_garch | stock$log_r < stock$lower_garch, 
+     na.rm = T)
+```
+
+```{r}
+# Predict the next day log return
+garch_est_mean <- ugarchforecast(mod2, n.ahead = 1)@forecast$seriesFor
+garch_est_risk <- ugarchforecast(mod2, n.ahead = 1)@forecast$sigmaFor
+
+# Chance of suffer a loss
+paste("Chance of suffer a loss:", 
+      round(pnorm(0, mean = garch_est_mean, sd = garch_est_risk)*100, 3), "%")
+
+# 95% CI of log return
+up95 <- garch_est_risk * 1.96 + garch_est_mean
+lo95 <- garch_est_risk * -1.96 + garch_est_mean
+paste("Log return 95% CI: (", round(lo95, 3), ",", round(up95 , 3), ")")
+
+# 95% CI of real return
+up95 <- exp(up95) - 1
+lo95 <- exp(lo95) - 1
+paste("Real return 95% CI: (", round(lo95, 3), ",", round(up95, 3), ")")
+
+# 95% CI of next day's price
+up95 <- (1 + up95) * stock$price[length(stock$price)]
+lo95 <- (1 + lo95) * stock$price[length(stock$price)]
+paste("Adjusted Price 95% CI: (", round(lo95, 3), ",", round(up95, 3), ")")
+```
+
+## GARCH - Student-t
+
+```{r}
+# Fit a ARMA(0,0) - GARCH(1,1) - student-t Model
+garch_spec <- ugarchspec(variance.model = list(model = "sGARCH", 
+                                               garchOrder = c(1,1)),
+           mean.model = list(armaOrder = c(0,0), 
+                             include.mean = TRUE),
+           distribution = "std")
+
+mod3 <- ugarchfit(garch_spec, stock$log_r[-1])
+```
+
+```{r}
+# Compute the critical value
+crit <- qt(0.975, df = mod3@fit$coef['shape'])
+crit
+
+# Compute the upper and lower bound manually
+stock <- mutate(stock,
+                upper_garch_t = c(NA, sigma(mod3) * crit + fitted(mod3)),
+                lower_garch_t = c(NA, sigma(mod3) * -crit + fitted(mod3)))
+```
+
+```{r}
+# Plot our predicted 95% CI against the real log return
+# Most of the time the black line should fall between the 95% CI
+
+ggplot(stock) +
+  geom_line(aes(Date, log_r)) +
+  geom_line(aes(Date, upper, col = "naive Normal")) +
+  geom_line(aes(Date, lower, col = "naive Normal")) +
+  geom_line(aes(Date, upper_t, col = "naive t")) +
+  geom_line(aes(Date, lower_t, col = "naive t")) +
+  geom_line(aes(Date, upper_garch, col = "GARCH Normal")) +
+  geom_line(aes(Date, lower_garch, col = "GARCH Normal")) +
+  geom_line(aes(Date, upper_garch_t, col = "GARCH t")) +
+  geom_line(aes(Date, lower_garch_t, col = "GARCH t")) +
+  theme_bw() +
+  ylab("Daily Log Return")
+```
+
+
+```{r}
+# How many percent of the time the log return will exceed the 95% CI
+# If it is greater than 5%, it means the assumption of the distribution is wrong or
+# the prediction of the risk is inaccurate
+mean(stock$log_r > stock$upper_garch_t | stock$log_r < stock$lower_garch_t, 
+     na.rm = T)
+```
+
+```{r}
+# Predict the next day log return
+garch_est_mean <- ugarchforecast(mod3, n.ahead = 1)@forecast$seriesFor
+garch_est_risk <- ugarchforecast(mod3, n.ahead = 1)@forecast$sigmaFor
+
+# Chance of suffer a loss
+paste("Chance of suffer a loss:", 
+      round(pt((-garch_est_mean)/garch_est_risk, 
+               df = mod3@fit$coef['shape'])*100,
+            3), 
+      "%")
+
+# 95% CI of log return
+up95 <- garch_est_risk * crit + garch_est_mean
+lo95 <- garch_est_risk * -crit + garch_est_mean
+paste("Log return 95% CI: (", round(lo95, 3), ",", round(up95 , 3), ")")
+
+# 95% CI of real return
+up95 <- exp(up95) - 1
+lo95 <- exp(lo95) - 1
+paste("Real return 95% CI: (", round(lo95, 3), ",", round(up95, 3), ")")
+
+# 95% CI of next day's price
+up95 <- (1 + up95) * stock$price[length(stock$price)]
+lo95 <- (1 + lo95) * stock$price[length(stock$price)]
+paste("Adjusted Price 95% CI: (", round(lo95, 3), ",", round(up95, 3), ")")
+```
+
+
